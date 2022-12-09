@@ -1,10 +1,11 @@
 defaults:
-  - root: base
+  - root: cnndm
   - optimizer: adamw
 
-gpuid: []
+gpuid: [0]
 keep_checkpoint_max: 5
 log: true
 model_pt:
 cuda: true
 resume_from_checkpoint:
+debug: false

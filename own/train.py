@@ -25,7 +25,7 @@ import torch.multiprocessing as mp
 from transformers import BartTokenizer, PegasusTokenizer, T5Tokenizer
 
 from own.utils.seeding import seed_everything
-from own.nn.optimization import get_optimizer, get_schedule_linear
+from own.nn.optimization import get_optimizer, get_schedule_linear, NoOpScheduler
 from own.nn.trainer import BRIOTrainer
 
 from utils import Recorder
@@ -104,8 +104,11 @@ def run(rank, cfg):
             model = model.cuda()
     model.train()
 
-    optimizer = get_optimizer(model, learning_rate=cfg.optimizer.learning_rate,
-        adam_eps=cfg.optimizer.adam_eps, weight_decay=cfg.optimizer.weight_decay)
+    if cfg.optimizer == "adamw":
+        optimizer = get_optimizer(model, learning_rate=cfg.optimizer.learning_rate,
+            adam_eps=cfg.optimizer.adam_eps, weight_decay=cfg.optimizer.weight_decay)
+    else:
+        optimizer = optim.Adam(model.parameters())
 
     num_replicas = 1
     if len(cfg.gpuid) > 1:
@@ -113,7 +116,12 @@ def run(rank, cfg):
     num_samples_per_replica = math.ceil(len(train_set) / num_replicas)
     updates_per_epoch = math.floor(num_samples_per_replica / (cfg.batch_size * cfg.accumulate_step))
     total_updates = updates_per_epoch * cfg.epoch
-    scheduler = get_schedule_linear(optimizer, cfg.warmup_steps, total_updates)
+
+    if cfg.optimizer == "adamw":
+        scheduler = get_schedule_linear(optimizer, cfg.warmup_steps, total_updates)
+    else:
+        scheduler = NoOpScheduler()
+
     if is_master:
         recorder.write_config(cfg, [model], __file__)
     scaler = GradScaler() if cfg.fp16 else None
@@ -141,16 +149,18 @@ def run(rank, cfg):
         optimizer_dict = torch.load(os.path.join(cfg.resume_from_checkpoint, "optimizer.pt"), map_location=lambda s, t: s)
         optimizer.load_state_dict(optimizer_dict)
 
-        logger.info("Loading scheduler state ...")
-        scheduler_dict = torch.load(os.path.join(cfg.resume_from_checkpoint, "scheduler.pt"), map_location=lambda s, t: s)
-        shift = int(scheduler_dict["last_epoch"])
-        logger.info("Steps shift %d", shift)
-        scheduler = get_schedule_linear(
-            optimizer,
-            cfg.warmup_steps,
-            total_updates,
-            steps_shift=shift
-        )
+        if cfg.optimizer == "adamw":
+            logger.info("Loading scheduler state ...")
+            scheduler_state = torch.load(os.path.join(cfg.resume_from_checkpoint, "scheduler.pt"), map_location=lambda s, t: s)
+            scheduler.load_state_dict(scheduler_state)
+            # shift = int(scheduler_dict["last_epoch"])
+            # logger.info("Steps shift %d", shift)
+            # scheduler = get_schedule_linear(
+            #     optimizer,
+            #     cfg.warmup_steps,
+            #     total_updates,
+            #     steps_shift=shift
+            # )
 
         logger.info("Loading RNG state ...")
         if is_mp:
@@ -182,6 +192,13 @@ def run(rank, cfg):
         mle_fn = label_smoothing_loss(ignore_index=tokenizer.pad_token_id, epsilon=cfg.smooth)
     else:
         mle_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+
+    # debug
+    if cfg.debug:
+        rng_states = torch.load('rng_states.pth', map_location=lambda s, t: s)
+        random.setstate(rng_states["python"])
+        np.random.set_state(rng_states["numpy"])
+        torch.random.set_rng_state(rng_states["cpu"])
 
     # instantiate trainer
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
