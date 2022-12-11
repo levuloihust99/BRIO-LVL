@@ -25,12 +25,11 @@ import torch.multiprocessing as mp
 from transformers import BartTokenizer, PegasusTokenizer, T5Tokenizer
 
 from own.utils.seeding import seed_everything
-from own.nn.optimization import get_optimizer, get_schedule_linear, NoOpScheduler
+from own.nn.optimization import get_optimizer, get_schedule_linear, get_schedule_quadratic
 from own.nn.trainer import BRIOTrainer
 
 from utils import Recorder
-from data_utils import to_cuda, collate_mp_brio, BrioDataset
-from config import base_setting, cnndm_setting, xsum_setting, abmusu_settings
+from data_utils import collate_mp_brio, BrioDataset
 from label_smoothing_loss import label_smoothing_loss
 from model import RankingLoss, BRIO
 
@@ -86,8 +85,7 @@ def run(rank, cfg):
         val_dataloader = DataLoader(val_set, batch_size=1, shuffle=False, num_workers=4, collate_fn=collate_fn_val, sampler=val_sampler)
         val_gen_dataloader = DataLoader(val_set, batch_size=8, shuffle=False, num_workers=4, collate_fn=collate_fn_val, sampler=val_sampler)
     else:
-        # dataloader = DataLoader(train_set, batch_size=cfg.batch_size, shuffle=True, num_workers=4, collate_fn=collate_fn)
-        dataloader = DataLoader(train_set, batch_size=cfg.batch_size, shuffle=False, num_workers=4, collate_fn=collate_fn) # debug
+        dataloader = DataLoader(train_set, batch_size=cfg.batch_size, shuffle=True, num_workers=4, collate_fn=collate_fn)
         val_dataloader = DataLoader(val_set, batch_size=1, shuffle=False, num_workers=4, collate_fn=collate_fn_val)
         val_gen_dataloader = DataLoader(val_set, batch_size=8, shuffle=False, num_workers=4, collate_fn=collate_fn_val)
 
@@ -108,7 +106,7 @@ def run(rank, cfg):
         optimizer = get_optimizer(model, learning_rate=cfg.optimizer.learning_rate,
             adam_eps=cfg.optimizer.adam_eps, weight_decay=cfg.optimizer.weight_decay)
     else:
-        optimizer = optim.Adam(model.parameters())
+        optimizer = optim.Adam(model.parameters(), lr=cfg.max_lr)
 
     num_replicas = 1
     if len(cfg.gpuid) > 1:
@@ -120,7 +118,7 @@ def run(rank, cfg):
     if cfg.optimizer == "adamw":
         scheduler = get_schedule_linear(optimizer, cfg.warmup_steps, total_updates)
     else:
-        scheduler = NoOpScheduler()
+        scheduler = get_schedule_quadratic(optimizer, cfg.warmup_steps)
 
     if is_master:
         recorder.write_config(cfg, [model], __file__)
@@ -129,8 +127,8 @@ def run(rank, cfg):
     # TODO: restore checkpoint
     training_state = {
         "best_metric": {
-            "scoring/avg_rank": 1000,
-            "generation/rouge-2-f": 0.0
+            f"scoring/{cfg.scoring_metric}": 1000,
+            f"generation/{cfg.generation_metric}": 1000
         },
         "best_checkpoint": {
             "scoring": None,
@@ -149,18 +147,17 @@ def run(rank, cfg):
         optimizer_dict = torch.load(os.path.join(cfg.resume_from_checkpoint, "optimizer.pt"), map_location=lambda s, t: s)
         optimizer.load_state_dict(optimizer_dict)
 
-        if cfg.optimizer == "adamw":
-            logger.info("Loading scheduler state ...")
-            scheduler_state = torch.load(os.path.join(cfg.resume_from_checkpoint, "scheduler.pt"), map_location=lambda s, t: s)
-            scheduler.load_state_dict(scheduler_state)
-            # shift = int(scheduler_dict["last_epoch"])
-            # logger.info("Steps shift %d", shift)
-            # scheduler = get_schedule_linear(
-            #     optimizer,
-            #     cfg.warmup_steps,
-            #     total_updates,
-            #     steps_shift=shift
-            # )
+        logger.info("Loading scheduler state ...")
+        scheduler_state = torch.load(os.path.join(cfg.resume_from_checkpoint, "scheduler.pt"), map_location=lambda s, t: s)
+        scheduler.load_state_dict(scheduler_state)
+        # shift = int(scheduler_dict["last_epoch"])
+        # logger.info("Steps shift %d", shift)
+        # scheduler = get_schedule_linear(
+        #     optimizer,
+        #     cfg.warmup_steps,
+        #     total_updates,
+        #     steps_shift=shift
+        # )
 
         logger.info("Loading RNG state ...")
         if is_mp:
@@ -192,13 +189,6 @@ def run(rank, cfg):
         mle_fn = label_smoothing_loss(ignore_index=tokenizer.pad_token_id, epsilon=cfg.smooth)
     else:
         mle_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
-
-    # debug
-    if cfg.debug:
-        rng_states = torch.load('rng_states.pth', map_location=lambda s, t: s)
-        random.setstate(rng_states["python"])
-        np.random.set_state(rng_states["numpy"])
-        torch.random.set_rng_state(rng_states["cpu"])
 
     # instantiate trainer
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")

@@ -33,13 +33,8 @@ def get_schedule_linear(optimizer, warmup_steps, training_steps, steps_shift=0, 
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 
-def no_op():
-    pass
-
-
-class NoOpScheduler(object):
-    def __init__(self):
-        pass
-
-    def step(self):
-        pass
+def get_schedule_quadratic(optimizer, warmup_steps, last_epoch=-1):
+    def lr_lambda(current_step):
+        step = max(1, current_step)
+        return min(step ** (-0.5), current_step * (max(1, warmup_steps) ** (-1.5)))
+    return LambdaLR(optimizer, lr_lambda, last_epoch)

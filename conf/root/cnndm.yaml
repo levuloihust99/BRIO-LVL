@@ -38,3 +38,5 @@ num_beams: 4
 fp16: true
 train_split: train
 val_split: val
+generation_metric: rougeCombine
+scoring_metric: rougeCombine

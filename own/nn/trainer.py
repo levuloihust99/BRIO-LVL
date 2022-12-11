@@ -7,10 +7,14 @@ import numpy as np
 import shutil
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.cuda.amp import GradScaler, autocast
 from rouge_metric import PyRouge
 from tqdm import tqdm
+
+from compare_mt.rouge.rouge_scorer import RougeScorer
+from nltk import sent_tokenize, word_tokenize
 
 from model import RankingLoss
 from data_utils import to_cuda
@@ -22,6 +26,37 @@ logger = logging.getLogger(__name__)
 rouge = PyRouge(rouge_n=(1, 2, 4), rouge_l=True, rouge_w=True,
                     rouge_w_weight=1.2, rouge_s=True, rouge_su=True, skip_gap=4)
 
+def transform_cnndm_scoring_metric(kwargs):
+    rouge1 = kwargs['rouge1']
+    rouge2 = kwargs['rouge2']
+    rougeLsum = kwargs['rougeLsum']
+    return 1 - (rouge1 * rouge2 + rougeLsum) / 3
+
+def transform_xsum_scoring_metric(kwargs):
+    rouge1 = kwargs['rouge1']
+    rouge2 = kwargs['rouge2']
+    return 1 - 2 * rouge1 * rouge2 / (rouge1 + rouge2)
+
+def transform_abmusu_scoring_metric(kwargs):
+    avg_rank = kwargs['avg_rank']
+    return avg_rank
+
+def transform_cnndm_generation_metric(kwargs):
+    rouge1 = kwargs['rouge1']
+    rouge2 = kwargs['rouge2']
+    rougeLsum = kwargs['rougeLsum']
+    return 1 - (rouge1 * rouge2 + rougeLsum) / 3
+
+def transform_xsum_generation_metric(kwargs):
+    rouge1 = kwargs['rouge1']
+    rouge2 = kwargs['rouge2']
+    return 1 - 2 * rouge1 * rouge2 / (rouge1 + rouge2)
+
+def transform_abmusu_generation_metric(**kwargs):
+    return -kwargs["rouge-2-f"]
+
+def process_text(text):
+    return sent_tokenize(" ".join(word_tokenize(text.strip())))
 
 class BRIOTrainer(object):
     def __init__(
@@ -65,9 +100,23 @@ class BRIOTrainer(object):
         self.run_id = run_id
     
     def train(self):
-        global_step = self.training_state["global_step"]
+        if self.cfg.config == "abmusu":
+            transform_scoring_fn = transform_abmusu_scoring_metric
+            transform_generation_fn = transform_abmusu_generation_metric
+        elif self.cfg.config == "xsum":
+            transform_scoring_fn = transform_xsum_scoring_metric
+            transform_generation_fn = transform_xsum_generation_metric
+        else:
+            transform_scoring_fn = transform_cnndm_scoring_metric
+            transform_generation_fn = transform_cnndm_generation_metric
+
+        global_step = self.training_state["global_step"] # number of updates
         trained_epoch = self.training_state["epoch"]
         data_step = self.training_state["data_step"]
+        batches_per_epoch = len(self.dataloader)
+        if data_step == batches_per_epoch:
+            trained_epoch += 1
+            data_step = 0
 
         logger.info("*********************** Start training ***********************")
         logger.info("Num examples = {}".format(len(self.dataloader.dataset)))
@@ -80,20 +129,16 @@ class BRIOTrainer(object):
             .format(self.cfg.batch_size * self.cfg.accumulate_step * len(self.cfg.gpuid)))
 
         if trained_epoch > 0 or data_step > 0:
-            logger.info("\tModel has been trained for {} epochs and {} data steps.".format(trained_epoch, data_step))
+            logger.info("Model has been trained for {} epochs and {} data steps.".format(trained_epoch, data_step))
+
+        step_count = 0
+        avg_ranking_loss = 0
+        avg_mle_loss = 0
+        avg_loss = 0
+        self.optimizer.zero_grad()
 
         for epoch in range(trained_epoch, self.cfg.epoch):
             logger.info("**************************** EPOCH {}/{} ****************************".format(epoch + 1, self.cfg.epoch))
-            self.optimizer.zero_grad()
-            avg_ranking_loss = 0
-            avg_mle_loss = 0
-            step_count = 0
-            assert data_step % self.cfg.accumulate_step == 0, \
-                ("data_step={}, not divisible by accumulate_step={}. "
-                "This is likely due to the fact that checkpoint was saved during gradient accumulation. "
-                "You should only save checkpoint after a proper update.")
-            epoch_step = data_step // self.cfg.accumulate_step
-            avg_loss = 0
             self.training_state['epoch'] = epoch
             t0 = time.perf_counter()
 
@@ -151,7 +196,6 @@ class BRIOTrainer(object):
                     if self.cfg.grad_norm > 0:
                         nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_norm)
                     step_count = 0
-                    epoch_step += 1
                     global_step += 1
                     self.training_state['global_step'] = global_step
 
@@ -164,7 +208,7 @@ class BRIOTrainer(object):
                     self.scheduler.step()
                     self.optimizer.zero_grad()
 
-                if epoch_step % self.cfg.report_freq == 0 and step_count == 0 and self.is_master:
+                if global_step % self.cfg.report_freq == 0 and step_count == 0 and self.is_master:
                     # report stats
                     logger.info("id: {}".format(self.run_id))
                     logger.info(f"similarity: {similarity[:, :10]}")
@@ -173,7 +217,7 @@ class BRIOTrainer(object):
                         logger.info(f"gold similarity: {gold_similarity}")
 
                     self.recorder.print("epoch: %d, batch: %d, avg loss: %.6f, avg ranking loss: %.6f, avg mle loss: %.6f"
-                        % (epoch + 1, epoch_step, avg_loss / self.cfg.report_freq,
+                        % (epoch, i + 1, avg_loss / self.cfg.report_freq,
                                 avg_ranking_loss / self.cfg.report_freq, avg_mle_loss / self.cfg.report_freq))
 
                     self.recorder.print(f"learning rate: {self.scheduler.get_last_lr()[0]:.6f}")
@@ -191,20 +235,23 @@ class BRIOTrainer(object):
                 del similarity, gold_similarity, loss, mle_loss, ranking_loss, output, probs
 
                 if global_step % self.cfg.eval_interval == 0 and global_step != 0 and step_count == 0:
+                    self.model.eval()
                     # evaluate the model as a scorer
                     scoring_metrics = self.scoring_evaluate()
+                    scoring_metric = transform_scoring_fn(scoring_metrics)
+                    scoring_metrics.update({self.cfg.scoring_metric: scoring_metric})
                     formatted_scoring_metrics = {f"eval/scoring/{k}": v for k, v in scoring_metrics.items()}
                     self.recorder.write_log(formatted_scoring_metrics, global_step)
 
                     if self.is_master:
                         self.recorder.print()
                     
-                    if self.training_state["best_metric"]["scoring/avg_rank"] > scoring_metrics['avg_rank']:
-                        self.training_state["best_metric"]["scoring/avg_rank"] = scoring_metrics['avg_rank']
+                    if self.training_state["best_metric"][f"scoring/{self.cfg.scoring_metric}"] > scoring_metrics[self.cfg.scoring_metric]:
+                        self.training_state["best_metric"][f"scoring/{self.cfg.scoring_metric}"] = scoring_metrics[self.cfg.scoring_metric]
                         cp_name = "checkpoint-{}".format(global_step)
                         self.training_state["best_checkpoint"]["scoring"] = cp_name
                         self.recorder.print(
-                            "best ranking metric - epoch: %d, batch: %d" % (epoch, i / self.cfg.accumulate_step))
+                            "best ranking metric - epoch: %d, batch: %d" % (epoch, i + 1))
 
                     if self.is_master:
                         self.recorder.print("val ranking metric: {}".format(scoring_metrics))
@@ -212,27 +259,37 @@ class BRIOTrainer(object):
                     # evaluate the model as a generator
                     if self.cfg.do_generate:
                         generation_metrics = self.generation_evaluate()
-                        formatted_generation_metrics = {f"eval/generation/{k}": v for k, v in generation_metrics.items()}
-                        self.recorder.write_log(formatted_generation_metrics, global_step)
-                        self.recorder.print()
+                        generation_metric = transform_generation_fn(generation_metrics)
+                        generation_metrics.update({self.cfg.generation_metric: generation_metric})
+                    else:
+                        generation_metrics = {"mle_loss": scoring_metrics["mle_loss"], self.cfg.generation_metric: 1000}
 
-                        if self.training_state["best_metric"]["generation/rouge-2-f"] < generation_metrics["rouge-2-f"]:
-                            self.training_state["best_metric"]["generation/rouge-2-f"] = generation_metrics["rouge-2-f"]
-                            cp_name = "checkpoint-{}".format(global_step)
-                            self.training_state["best_checkpoint"]["generation"] = cp_name
-                            self.recorder.print(
-                                "best generation metric - epoch: %d, batch: %d" % (epoch, i / self.cfg.accumulate_step))
-                    
+                    formatted_generation_metrics = {f"eval/generation/{k}": v for k, v in generation_metrics.items()}
+                    self.recorder.write_log(formatted_generation_metrics, global_step)
+                    self.recorder.print()
+
+                    if self.training_state["best_metric"][f"generation/{self.cfg.generation_metric}"] > generation_metrics[self.cfg.generation_metric]:
+                        self.training_state["best_metric"][f"generation/{self.cfg.generation_metric}"] = generation_metrics[self.cfg.generation_metric]
+                        cp_name = "checkpoint-{}".format(global_step)
+                        self.training_state["best_checkpoint"]["generation"] = cp_name
+                        self.recorder.print(
+                            "best generation metric - epoch: %d, batch: %d" % (epoch, i + 1))
+                    self.model.train()
                     if self.is_master:
                         self.save_checkpoint()
+
+                if i + 1 == batches_per_epoch: # last item of this data iterator
+                    data_step = 0
 
     def generation_evaluate(self):
         self.model.generation_mode() # switch to generation mode
         hypotheses = []
         references = []
+        rouge_scorer = RougeScorer(['rouge1', 'rouge2', 'rougeLsum'], use_stemmer=True)
+        rouge1, rouge2, rougeLsum = 0.0, 0.0, 0.0
 
         with torch.no_grad():
-            for (i, batch) in tqdm(enumerate(self.val_gen_dataloader), total=len(self.val_gen_dataloader)):
+            for i, batch in tqdm(enumerate(self.val_gen_dataloader), total=len(self.val_gen_dataloader)):
                 if self.cfg.cuda:
                     to_cuda(batch, self.device)
                 samples = batch["data"]
@@ -261,20 +318,44 @@ class BRIOTrainer(object):
             global_hypotheses = hypotheses
             global_references = references
         
-        metrics = rouge.evaluate(global_hypotheses, global_references)
-        output = {}
-        for metric_type, metric_value in metrics.items():
-            for subtype, subvalue in metric_value.items():
-                output[f"{metric_type}-{subtype}"] = subvalue
+        if self.cfg.config == "abmusu":
+            metrics = rouge.evaluate(global_hypotheses, global_references)
+            output = {}
+            for metric_type, metric_value in metrics.items():
+                for subtype, subvalue in metric_value.items():
+                    output[f"{metric_type}-{subtype}"] = subvalue
+            return output
+        else:
+            for hypothesis, reference in zip(global_hypotheses, global_references):
+                hypothesis = hypothesis.replace("\n", " ")
+                hypothesis = process_text(hypothesis)
+                reference = process_text(reference[0])
+                score = rouge_scorer.score("\n".join(reference), "\n".join(hypothesis))
+                rouge1 += score["rouge1"].fmeasure
+                rouge2 += score["rouge2"].fmeasure
+                rougeLsum += score["rougeLsum"].fmeasure
 
-        return output
+            rouge1 = torch.FloatTensor([rouge1]).to(self.device)
+            rouge2 = torch.FloatTensor([rouge2]).to(self.device)
+            rougeLsum = torch.FloatTensor([rougeLsum]).to(self.device)
+            if self.is_mp:
+                dist.all_reduce(rouge1, op=dist.reduce_op.SUM)
+                dist.all_reduce(rouge2, op=dist.reduce_op.SUM)
+                dist.all_reduce(rougeLsum, op=dist.reduce_op.SUM)
+            count = len(global_hypotheses)
+            rouge1 = rouge1[0].item() / count
+            rouge2 = rouge2[0].item() / count
+            rougeLsum = rougeLsum[0].item() / count
+            return {"rouge1": rouge1, "rouge2": rouge2, "rougeLsum": rougeLsum}
 
     def scoring_evaluate(self):
         all_rank_ids = []
         mle_loss = 0.0
         count = 0
+        rouge_scorer = RougeScorer(['rouge1', 'rouge2', 'rougeLsum'], use_stemmer=True)
+        rouge1, rouge2, rougeLsum = 0.0, 0.0, 0.0
         with torch.no_grad():
-            for (i, batch) in tqdm(enumerate(self.val_dataloader), total=len(self.val_dataloader)):
+            for i, batch in tqdm(enumerate(self.val_dataloader), total=len(self.val_dataloader)):
                 if self.cfg.cuda:
                     to_cuda(batch, self.device)
                 output = self.model(
@@ -295,12 +376,51 @@ class BRIOTrainer(object):
                     logger.info(f"test similarity: {similarity[0]}")
                 max_ids = similarity.argmax(1) # [bz]
                 count += max_ids.shape[0]
-                all_rank_ids.append(max_ids)
-        
-        all_rank_ids = np.concatenate(all_rank_ids, axis=0)
-        avg_rank = (all_rank_ids + 1).sum() / all_rank_ids.shape[0]
-        mle_loss = mle_loss / count
-        return {"avg_rank": avg_rank, "mle_loss": mle_loss}
+
+                # abmusu average rank
+                if self.cfg.config == "abmusu":
+                    all_rank_ids.append(max_ids)
+                else: # cnndm, xsum
+                    for j in range(similarity.shape[0]):
+                        sample = batch["data"][j]
+                        sentences = sample["candidates"][max_ids[j]][0]
+                        score = rouge_scorer.score("\n".join(sample["abstract"]), "\n".join(sentences))
+                        rouge1 += score["rouge1"].fmeasure
+                        rouge2 += score["rouge2"].fmeasure
+                        rougeLsum += score["rougeLsum"].fmeasure
+
+        count = torch.FloatTensor([count]).to(self.device)
+        mle_loss = torch.FloatTensor([mle_loss]).to(self.device)
+        if self.cfg.config != "abmusu":
+            rouge1 = torch.FloatTensor([rouge1]).to(self.device)
+            rouge2 = torch.FloatTensor([rouge2]).to(self.device)
+            rougeLsum = torch.FloatTensor([rougeLsum]).to(self.device)
+
+        if self.is_mp:
+            dist.all_reduce(count, op=dist.reduce_op.SUM)
+            dist.all_reduce(mle_loss, op=dist.reduce_op.SUM)
+            if self.cfg.config == "abmusu":
+                global_rank_ids = all_gather_list(all_rank_ids)
+                all_rank_ids = [rank_ids for local_rank_ids in global_rank_ids for rank_ids in local_rank_ids]
+            else:
+                dist.all_reduce(rouge1, op=dist.reduce_op.SUM)
+                dist.all_reduce(rouge2, op=dist.reduce_op.SUM)
+                dist.all_reduce(rougeLsum, op=dist.reduce_op.SUM)
+
+        count = count[0].item()
+        if self.cfg.config == "abmusu":
+            all_rank_ids = np.concatenate(all_rank_ids, axis=0)
+            avg_rank = (all_rank_ids + 1).sum() / all_rank_ids.shape[0]
+        else:
+            rouge1 = rouge1[0].item() / count
+            rouge2 = rouge2[0].item() / count
+            rougeLsum = rougeLsum[0].item() / count
+        mle_loss = mle_loss[0].item() / count
+
+        if self.cfg.config == "abmusu":
+            return {"avg_rank": avg_rank, "mle_loss": mle_loss}
+        else:
+            return {"rouge1": rouge1, "rouge2": rouge2, "rougeLsum": rougeLsum, "mle_loss": mle_loss}
 
     def save_checkpoint(self):
         checkpoint_dir = os.path.join(self.recorder.dir, "checkpoints")
@@ -351,12 +471,16 @@ class BRIOTrainer(object):
         best_generation_checkpoint = self.training_state["best_checkpoint"]["generation"]
         best_scoring_checkpoint = self.training_state["best_checkpoint"]["scoring"]
 
-        best_generation_checkpoint = os.path.join(checkpoint_dir,
-            best_generation_checkpoint)
-        best_scoring_checkpoint = os.path.join(checkpoint_dir,
-            best_scoring_checkpoint)
+        kept_checkpoints = set()
+        if best_generation_checkpoint:
+            best_generation_checkpoint = os.path.join(checkpoint_dir,
+                best_generation_checkpoint)
+            kept_checkpoints.add(best_generation_checkpoint)
+        if best_scoring_checkpoint:
+            best_scoring_checkpoint = os.path.join(checkpoint_dir,
+                best_scoring_checkpoint)
+            kept_checkpoints.add(best_scoring_checkpoint)
         
-        kept_checkpoints = {best_generation_checkpoint, best_scoring_checkpoint}
         for cp in all_checkpoints:
             if len(kept_checkpoints) >= self.cfg.keep_checkpoint_max:
                 break
@@ -365,4 +489,5 @@ class BRIOTrainer(object):
         
         tobe_removed_checkpoints = [cp for cp in all_checkpoints if cp not in kept_checkpoints]
         for cp in tobe_removed_checkpoints:
-            logger.info("Deleting {} since maximum kept checkpoints is 5...".format(cp))
+            logger.info("Deleting {} since maximum kept checkpoints is {}...".format(self.cfg.keep_checkpoint_max))
+            os.remove(cp)

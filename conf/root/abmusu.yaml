@@ -38,3 +38,5 @@ num_beams: 1
 fp16: true
 train_split: train
 val_split: val
+generation_metric: negative-rouge-2-f
+scoring_metric: avg_rank

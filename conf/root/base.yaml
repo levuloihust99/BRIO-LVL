@@ -38,3 +38,5 @@ num_beams: 4 # number of beams for beam search
 fp16: false
 train_split: train # name of the directory containing train data split
 val_split: val # name of the directory containing val data split
+generation_metric: rougeCombine
+scoring_metric: rougeCombine
