@@ -298,7 +298,12 @@ class BRIOTrainer(object):
                 summaries = self.model.generate(
                     input_ids=dct["input_ids"].to(self.device),
                     attention_mask=dct["attention_mask"].to(self.device),
-                    max_length=500,
+                    max_length=self.cfg.gen_max_len + 2,  # +2 from original because we start at step=1 and stop before max_length
+                    min_length=self.cfg.gen_min_len + 1,  # +1 from original because we start at step=1
+                    no_repeat_ngram_size=3,
+                    num_beams=self.cfg.num_beams,
+                    length_penalty=self.cfg.length_penalty,
+                    early_stopping=True,
                 )
                 batch_hypotheses = [self.tokenizer.decode(g, skip_special_tokens=True, clean_up_tokenization_spaces=False) for g in summaries]
                 batch_references = [[" ".join(x['abstract_untok'])] for x in samples]
