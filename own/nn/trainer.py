@@ -228,7 +228,9 @@ class BRIOTrainer(object):
 
                     avg_mle_loss, avg_ranking_loss, avg_loss = 0, 0, 0
 
-                    logger.info("\x1b[38;5;3mElapsed time: {}\x1b[0m".format(time.perf_counter() - t0))
+                    elapsed_time = time.perf_counter() - t0
+                    logger.info("\x1b[38;5;3mElapsed time: {}\x1b[0m".format(elapsed_time))
+                    self.recorder.print("Elapsed time: {}".format(elapsed_time))
                     logger.info("\x1b[38;5;3m----------------------------------------------\x1b[0m")
                     t0 = time.perf_counter()
 
