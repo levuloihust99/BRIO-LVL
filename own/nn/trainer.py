@@ -276,6 +276,10 @@ class BRIOTrainer(object):
                         self.training_state["best_checkpoint"]["generation"] = cp_name
                         self.recorder.print(
                             "best generation metric - epoch: %d, batch: %d" % (epoch, i + 1))
+                    
+                    if self.is_master:
+                        self.recorder.print("generation metric: {}".format(generation_metrics))
+
                     self.model.train()
                     if self.is_master:
                         self.save_checkpoint()
@@ -473,6 +477,8 @@ class BRIOTrainer(object):
         all_checkpoints = os.listdir(checkpoint_dir)
         all_checkpoints = [os.path.join(checkpoint_dir, cp_name) for cp_name in all_checkpoints]
         all_checkpoints = sorted(all_checkpoints, key=lambda x: os.path.getctime(x), reverse=True)
+        self.recorder.print("All checkpoints:")
+        self.recorder.print(all_checkpoints)
 
         # always keep these 2 best checkpoints
         best_generation_checkpoint = self.training_state["best_checkpoint"]["generation"]
@@ -497,6 +503,8 @@ class BRIOTrainer(object):
         self.recorder.print("Kept checkpoits: ")
         self.recorder.print(kept_checkpoints)
         tobe_removed_checkpoints = [cp for cp in all_checkpoints if cp not in kept_checkpoints]
+        self.recorder.print("To be removed checkpoints")
+        self.recorder.print(tobe_removed_checkpoints)
         for cp in tobe_removed_checkpoints:
             logger.info("Deleting {} since maximum kept checkpoints is {}...".format(self.cfg.keep_checkpoint_max))
             os.remove(cp)
