@@ -493,7 +493,9 @@ class BRIOTrainer(object):
                 break
             if cp not in kept_checkpoints:
                 kept_checkpoints.add(cp)
-        
+
+        self.recorder.print("Kept checkpoits: ")
+        self.recorder.print(kept_checkpoints)
         tobe_removed_checkpoints = [cp for cp in all_checkpoints if cp not in kept_checkpoints]
         for cp in tobe_removed_checkpoints:
             logger.info("Deleting {} since maximum kept checkpoints is {}...".format(self.cfg.keep_checkpoint_max))
