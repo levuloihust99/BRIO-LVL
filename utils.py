@@ -29,8 +29,8 @@ class Recorder():
                     print(x, file=f)
                     print(file=f)
         logger.info("{}\n".format(args))
-        for (i, x) in enumerate(models):
-            logger.info("{}\n".format(x))
+        # for (i, x) in enumerate(models):
+        #     logger.info("{}\n".format(x))
 
     def print(self, x=None):
         if x is not None:
