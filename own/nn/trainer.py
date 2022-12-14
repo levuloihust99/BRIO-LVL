@@ -507,4 +507,4 @@ class BRIOTrainer(object):
         self.recorder.print(tobe_removed_checkpoints)
         for cp in tobe_removed_checkpoints:
             logger.info("Deleting {} since maximum kept checkpoints is {}...".format(cp, self.cfg.keep_checkpoint_max))
-            os.remove(cp)
+            shutil.rmtree(cp)
